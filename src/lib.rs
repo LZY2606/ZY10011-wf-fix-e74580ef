@@ -417,7 +417,9 @@ extern crate serde_json;
 pub use self::block::{BlockContext, BlockParamHolder, BlockParams};
 pub use self::context::Context;
 pub use self::decorators::DecoratorDef;
-pub use self::error::{RenderError, RenderErrorReason, TemplateError, TemplateErrorReason};
+pub use self::error::{
+    RenderError, RenderErrorReason, TemplateError, TemplateErrorReason, TemplatePackageError,
+};
 pub use self::helpers::{HelperDef, HelperResult};
 pub use self::json::path::{Path, PathSeg};
 pub use self::json::value::{JsonRender, JsonTruthy, PathAndJson, ScopedJson, to_json};

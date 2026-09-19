@@ -281,6 +281,77 @@ impl From<(IOError, String)> for TemplateError {
     }
 }
 
+/// Error on updating a template package.
+///
+/// Returned by
+/// [`Registry::register_template_package`](crate::Registry::register_template_package)
+/// and
+/// [`Registry::register_template_package_files`](crate::Registry::register_template_package_files).
+///
+/// A package update is atomic: when this error is returned, none of the
+/// submitted templates were installed and the registry keeps exactly the
+/// state it had before the call.
+///
+/// The error always reports *every* failed member of the package, not just
+/// the first one encountered. Members are listed in a stable order (sorted
+/// by template name), so the same failing input always produces the same
+/// error.
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum TemplatePackageError {
+    /// One or more package members failed to compile. The vector contains
+    /// every compilation failure, sorted by template name.
+    #[error("failed to compile {} package template(s): {}", .0.len(), format_template_names(.0))]
+    Compile(Vec<TemplateError>),
+    /// One or more package members reference partials that would not exist
+    /// after the update: they are neither part of the submitted package nor
+    /// registered in the registry outside the package being replaced. Each
+    /// item is a `(member_name, missing_partial)` pair, sorted by member
+    /// name then partial name.
+    #[error(
+        "unresolved partial reference(s) in template package: {}",
+        format_unresolved_partials(.0)
+    )]
+    UnresolvedPartials(Vec<(String, String)>),
+}
+
+impl TemplatePackageError {
+    /// Names of the package members that caused this error, in stable
+    /// (sorted) order.
+    pub fn template_names(&self) -> Vec<&str> {
+        match self {
+            TemplatePackageError::Compile(errors) => errors
+                .iter()
+                .filter_map(|e| e.name().map(String::as_str))
+                .collect(),
+            TemplatePackageError::UnresolvedPartials(pairs) => {
+                pairs.iter().map(|(member, _)| member.as_str()).collect()
+            }
+        }
+    }
+}
+
+fn format_template_names(errors: &[TemplateError]) -> String {
+    errors
+        .iter()
+        .map(|e| {
+            e.name()
+                .map(String::as_str)
+                .unwrap_or("Unnamed template")
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_unresolved_partials(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(member, partial)| format!("\"{member}\" requires \"{partial}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(feature = "dir_source")]
 impl From<WalkdirError> for TemplateError {
     fn from(e: WalkdirError) -> TemplateError {

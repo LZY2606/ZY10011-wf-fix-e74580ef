@@ -1,5 +1,23 @@
 # Change Log
 
+## [Unreleased]
+
+* [Added] Atomic template package updates on `Registry`:
+  `register_template_package` and `register_template_package_files` install a
+  set of mutually referencing templates/partials as one version. The whole
+  package is compiled and its static partial references are checked for
+  closure before anything changes; on any failure a `TemplatePackageError`
+  listing every failed member (in stable, sorted order) is returned and the
+  registry keeps its previous visible state. Members dropped from the
+  previous package are removed together with their dev-mode sources, and
+  replaying identical content is idempotent.
+
+  Design note: all fallible work (compilation, dependency-closure check)
+  happens before any registry state is touched. The commit point is a short,
+  infallible sequence of map replacements performed while holding `&mut
+  self`, so a render can never observe a mixture of old and new package
+  members, and a failed update leaves no half-installed package behind.
+
 ## [6.4.4] - 2026-08-12
 
 * [Changed] We have to revert `preserve_json_order` as a default feature. Users

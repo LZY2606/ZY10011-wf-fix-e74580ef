@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::AsRef;
 use std::fmt::{self, Debug, Formatter};
 use std::io::{Error as IoError, Write};
@@ -12,13 +12,13 @@ use crate::context::Context;
 use crate::decorators::{self, DecoratorDef};
 #[cfg(feature = "script_helper")]
 use crate::error::ScriptError;
-use crate::error::{RenderError, RenderErrorReason, TemplateError};
+use crate::error::{RenderError, RenderErrorReason, TemplateError, TemplatePackageError};
 use crate::helpers::{self, HelperDef};
 use crate::output::{Output, StringOutput, WriteOutput};
 use crate::render::{RenderContext, Renderable};
 use crate::sources::{FileSource, Source};
 use crate::support::str::{self, StringWriter};
-use crate::template::{Template, TemplateOptions};
+use crate::template::{Parameter, Template, TemplateElement, TemplateOptions};
 
 #[cfg(feature = "dir_source")]
 use walkdir::WalkDir;
@@ -71,6 +71,9 @@ pub struct Registry<'reg> {
     dev_mode: bool,
     recursive_lookup: bool,
     prevent_indent: bool,
+    /// Names installed by the latest template package update. A package
+    /// update replaces exactly this set of names.
+    package_templates: BTreeSet<String>,
     #[cfg(feature = "script_helper")]
     pub(crate) engine: Arc<Engine>,
 
@@ -159,6 +162,7 @@ impl<'reg> Registry<'reg> {
             dev_mode: false,
             recursive_lookup: false,
             prevent_indent: false,
+            package_templates: BTreeSet::new(),
             #[cfg(feature = "script_helper")]
             engine: Arc::new(rhai_engine()),
             #[cfg(feature = "script_helper")]
@@ -315,6 +319,246 @@ impl<'reg> Registry<'reg> {
         S: AsRef<str>,
     {
         self.register_template_string(name, partial_str)
+    }
+
+    /// Atomically replace the registry's template package.
+    ///
+    /// A *template package* is a group of named templates and partials that
+    /// are deployed together and may reference each other via `{{> name}}`.
+    /// This method installs the given package as a whole:
+    ///
+    /// * Every submitted template is compiled first. If any of them fails,
+    ///   a [`TemplatePackageError`] listing **all** failed members (sorted by
+    ///   name) is returned and nothing changes.
+    /// * Statically resolvable partial references are checked against the
+    ///   state the registry would have after the update: every referenced
+    ///   name must be either a member of the submitted package or a template
+    ///   registered outside the package. Otherwise an
+    ///   [`TemplatePackageError::UnresolvedPartials`] listing every missing
+    ///   reference is returned and nothing changes. References that are only
+    ///   computable at render time (for example `{{> (lookup . "which")}}`)
+    ///   cannot be checked statically and are ignored.
+    /// * Only when the whole package compiles and its dependencies are
+    ///   closed is it committed: templates installed by the *previous*
+    ///   package update but absent from this one are removed (including
+    ///   their dev-mode sources, so dev mode cannot resurrect them from
+    ///   stale files), and the new members are installed.
+    ///
+    /// Templates registered through the other `register_*` methods are not
+    /// affected, unless their names collide with package members.
+    ///
+    /// Submitting the same package twice is idempotent: the second call
+    /// succeeds and leaves the visible state unchanged.
+    ///
+    /// # Atomicity
+    ///
+    /// All fallible work (compilation and dependency checks) happens before
+    /// any registry state is touched. The commit point is a short,
+    /// infallible sequence of map replacements performed while this method
+    /// holds `&mut self`, so no render can observe a mixture of old and new
+    /// package members: renders either completed before the update and saw
+    /// the old package, or start after it and see the new one. On failure
+    /// the registry is left byte-for-byte as it was before the call, so
+    /// there is never a half-installed package visible.
+    ///
+    /// ```
+    /// use handlebars::Handlebars;
+    ///
+    /// let mut hbs = Handlebars::new();
+    /// hbs.register_template_package([
+    ///     ("layout", "<body>{{> content}}</body>"),
+    ///     ("content", "hello {{who}}"),
+    /// ])
+    /// .unwrap();
+    /// assert_eq!(
+    ///     hbs.render("layout", &serde_json::json!({"who": "world"}))
+    ///         .unwrap(),
+    ///     "<body>hello world</body>"
+    /// );
+    ///
+    /// // A broken package changes nothing: the old version keeps working.
+    /// assert!(
+    ///     hbs.register_template_package([("layout", "{{#if}}{{/each}}")])
+    ///         .is_err()
+    /// );
+    /// assert_eq!(
+    ///     hbs.render("layout", &serde_json::json!({"who": "world"}))
+    ///         .unwrap(),
+    ///     "<body>hello world</body>"
+    /// );
+    ///
+    /// // A package whose partial references dangle is rejected, too.
+    /// assert!(
+    ///     hbs.register_template_package([("page", "{{> missing}}")])
+    ///         .is_err()
+    /// );
+    /// ```
+    pub fn register_template_package<N, S, I>(
+        &mut self,
+        templates: I,
+    ) -> Result<(), TemplatePackageError>
+    where
+        N: AsRef<str>,
+        S: AsRef<str>,
+        I: IntoIterator<Item = (N, S)>,
+    {
+        let mut compiled = BTreeMap::new();
+        let mut errors = Vec::new();
+        for (name, tpl_str) in templates {
+            let name = name.as_ref();
+            let result = Template::compile2(
+                tpl_str.as_ref(),
+                TemplateOptions {
+                    name: Some(name.to_owned()),
+                    is_partial: false,
+                    prevent_indent: self.prevent_indent,
+                },
+            );
+            match result {
+                Ok(template) => {
+                    compiled.insert(name.to_owned(), (template, None));
+                }
+                Err(err) => errors.push(err),
+            }
+        }
+        self.commit_template_package(compiled, errors)
+    }
+
+    /// Atomically replace the registry's template package with templates
+    /// loaded from files.
+    ///
+    /// Behaves exactly like [`Registry::register_template_package`], except
+    /// that template sources are read from the given paths. When dev mode is
+    /// enabled, the files are tracked as dev-mode sources (like
+    /// [`Registry::register_template_file`]) and reloaded on every render;
+    /// members dropped by a later package update have their sources removed,
+    /// so dev mode will not load them from the old files again.
+    ///
+    /// ```
+    /// use handlebars::Handlebars;
+    /// use std::io::Write;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let path = dir.path().join("greeting.hbs");
+    /// let mut file = std::fs::File::create(&path).unwrap();
+    /// write!(file, "hi {{{{who}}}}").unwrap();
+    /// drop(file);
+    ///
+    /// let mut hbs = Handlebars::new();
+    /// hbs.register_template_package_files([("greeting", &path)])
+    ///     .unwrap();
+    /// assert_eq!(
+    ///     hbs.render("greeting", &serde_json::json!({"who": "world"}))
+    ///         .unwrap(),
+    ///     "hi world"
+    /// );
+    /// ```
+    pub fn register_template_package_files<N, P, I>(
+        &mut self,
+        templates: I,
+    ) -> Result<(), TemplatePackageError>
+    where
+        N: AsRef<str>,
+        P: AsRef<Path>,
+        I: IntoIterator<Item = (N, P)>,
+    {
+        let mut compiled = BTreeMap::new();
+        let mut errors = Vec::new();
+        for (name, tpl_path) in templates {
+            let name = name.as_ref();
+            let source = FileSource::new(tpl_path.as_ref().into());
+            let result = source
+                .load()
+                .map_err(|err| TemplateError::from((err, name.to_owned())))
+                .and_then(|tpl_str| {
+                    Template::compile2(
+                        tpl_str.as_ref(),
+                        TemplateOptions {
+                            name: Some(name.to_owned()),
+                            is_partial: false,
+                            prevent_indent: self.prevent_indent,
+                        },
+                    )
+                });
+            match result {
+                Ok(template) => {
+                    let source: Arc<dyn Source<Item = String, Error = IoError> + Send + Sync> =
+                        Arc::new(source);
+                    compiled.insert(name.to_owned(), (template, Some(source)));
+                }
+                Err(err) => errors.push(err),
+            }
+        }
+        self.commit_template_package(compiled, errors)
+    }
+
+    /// Commit point of a template package update.
+    ///
+    /// `compiled` holds every package member that compiled successfully and
+    /// `errors` every compilation failure. When this function returns an
+    /// error, no registry state has been modified; when it returns `Ok`, the
+    /// whole package has been installed and the previous package removed.
+    fn commit_template_package(
+        &mut self,
+        compiled: BTreeMap<
+            String,
+            (
+                Template,
+                Option<Arc<dyn Source<Item = String, Error = IoError> + Send + Sync + 'reg>>,
+            ),
+        >,
+        mut errors: Vec<TemplateError>,
+    ) -> Result<(), TemplatePackageError> {
+        if !errors.is_empty() {
+            // Report every failed member in a stable order, independent of
+            // the caller's iteration order.
+            errors.sort_by(|a, b| a.name().cmp(&b.name()));
+            return Err(TemplatePackageError::Compile(errors));
+        }
+
+        // Check dependency closure against the post-update view: package
+        // members plus everything registered outside the package.
+        let visible_after_update = |name: &str| {
+            compiled.contains_key(name)
+                || (self.templates.contains_key(name) && !self.package_templates.contains(name))
+        };
+        let mut unresolved = Vec::new();
+        for (member, (template, _)) in &compiled {
+            let mut refs = BTreeSet::new();
+            let mut inlines = BTreeSet::new();
+            collect_partial_refs(template, &mut refs, &mut inlines);
+            for reference in refs.difference(&inlines) {
+                if !visible_after_update(reference) {
+                    unresolved.push((member.clone(), reference.clone()));
+                }
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(TemplatePackageError::UnresolvedPartials(unresolved));
+        }
+
+        // From here on nothing can fail: swap the package in one infallible
+        // sequence while holding `&mut self`, so concurrent renders (which
+        // would need `&self`) cannot observe a half-updated package.
+        for old_name in std::mem::take(&mut self.package_templates) {
+            self.templates.remove(&old_name);
+            self.template_sources.remove(&old_name);
+        }
+        for (name, (template, source)) in compiled {
+            self.templates.insert(name.clone(), template);
+            match source {
+                Some(source) if self.dev_mode => {
+                    self.template_sources.insert(name.clone(), source);
+                }
+                _ => {
+                    // A string-backed package member must not keep a stale
+                    // dev-mode source registered under the same name.
+                    self.template_sources.remove(&name);
+                }
+            }
+            self.package_templates.insert(name);
+        }
+        Ok(())
     }
 
     /// Register a template from a path on file system
@@ -503,6 +747,7 @@ impl<'reg> Registry<'reg> {
     pub fn unregister_template(&mut self, name: &str) {
         self.templates.remove(name);
         self.template_sources.remove(name);
+        self.package_templates.remove(name);
     }
 
     /// Register a helper
@@ -709,6 +954,7 @@ impl<'reg> Registry<'reg> {
     pub fn clear_templates(&mut self) {
         self.templates.clear();
         self.template_sources.clear();
+        self.package_templates.clear();
     }
 
     fn gather_dev_mode_templates(
@@ -912,6 +1158,68 @@ impl<'reg> Registry<'reg> {
         self.register_helper("shoutyKebabCase", Box::new(shouty_kebab_case));
         self.register_helper("titleCase", Box::new(title_case));
         self.register_helper("trainCase", Box::new(train_case));
+    }
+}
+
+/// Extract a statically known partial name from a parameter, if any.
+///
+/// Dynamic names (subexpressions like `{{> (lookup . "which")}}`) cannot be
+/// resolved without render-time data and return `None`.
+fn static_partial_name(param: &Parameter) -> Option<String> {
+    match param {
+        Parameter::Name(name) => Some(name.clone()),
+        Parameter::Path(path) => Some(path.raw().to_owned()),
+        Parameter::Literal(serde_json::Value::String(name)) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Collect statically resolvable partial references of a template into
+/// `refs`, and names of inline partials defined within the same template
+/// into `inlines`.
+///
+/// Inline partials (`{{#*inline "name"}}`) are render-context locals, so a
+/// reference to one of them inside the defining template does not require a
+/// registry-level template of that name.
+fn collect_partial_refs(
+    template: &Template,
+    refs: &mut BTreeSet<String>,
+    inlines: &mut BTreeSet<String>,
+) {
+    for element in &template.elements {
+        match element {
+            TemplateElement::PartialExpression(d) | TemplateElement::PartialBlock(d) => {
+                if let Some(name) = static_partial_name(&d.name) {
+                    if name != crate::partial::PARTIAL_BLOCK {
+                        refs.insert(name);
+                    }
+                }
+                if let Some(inner) = &d.template {
+                    collect_partial_refs(inner, refs, inlines);
+                }
+            }
+            TemplateElement::DecoratorExpression(d) | TemplateElement::DecoratorBlock(d) => {
+                if matches!(&d.name, Parameter::Name(name) if name == "inline") {
+                    if let Some(Parameter::Literal(serde_json::Value::String(name))) =
+                        d.params.first()
+                    {
+                        inlines.insert(name.clone());
+                    }
+                }
+                if let Some(inner) = &d.template {
+                    collect_partial_refs(inner, refs, inlines);
+                }
+            }
+            TemplateElement::HelperBlock(h) => {
+                if let Some(inner) = &h.template {
+                    collect_partial_refs(inner, refs, inlines);
+                }
+                if let Some(inner) = &h.inverse {
+                    collect_partial_refs(inner, refs, inlines);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1483,6 +1791,184 @@ mod test {
             reg.render("t1", &json!({"name": "Alex"})).unwrap(),
             "<h1>Privet Alex!</h1>"
         );
+
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn test_template_package_mutual_reference() {
+        let mut r = Registry::new();
+
+        // a template outside the package can be referenced by package members
+        r.register_template_string("shared/footer", "(footer)")
+            .unwrap();
+
+        r.register_template_package([
+            (
+                "page",
+                "<html>{{> header}}|{{> content}}|{{> shared/footer}}</html>",
+            ),
+            ("header", "HEADER"),
+            // package members may reference each other, in any order
+            ("content", "CONTENT[{{> aside}}]"),
+            ("aside", "ASIDE"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            r.render("page", &()).unwrap(),
+            "<html>HEADER|CONTENT[ASIDE]|(footer)</html>"
+        );
+        assert!(r.has_template("page"));
+        assert!(r.has_template("aside"));
+    }
+
+    #[test]
+    fn test_template_package_compile_failure_rolls_back() {
+        let mut r = Registry::new();
+
+        r.register_template_package([("index", "v1 {{who}}"), ("panel", "PANEL")])
+            .unwrap();
+        assert_eq!(r.render("index", &json!({"who": "one"})).unwrap(), "v1 one");
+
+        // two broken members and one good one; the update must fail and
+        // report *both* broken members in stable (sorted) order
+        let err = r
+            .register_template_package([
+                ("z_broken", "{{#if}}{{/each}}"),
+                ("a_broken", "{{#each}}{{/if}}"),
+                ("index", "v2 {{who}}"),
+                ("brand_new", "NEW"),
+            ])
+            .unwrap_err();
+        assert_eq!(err.template_names(), vec!["a_broken", "z_broken"]);
+
+        // the pre-call state is fully preserved: old members still render
+        // the old content, and no new member leaked in
+        assert_eq!(r.render("index", &json!({"who": "one"})).unwrap(), "v1 one");
+        assert_eq!(r.render("panel", &()).unwrap(), "PANEL");
+        assert!(!r.has_template("brand_new"));
+        assert!(!r.has_template("a_broken"));
+        assert!(!r.has_template("z_broken"));
+    }
+
+    #[test]
+    fn test_template_package_unresolved_partial_rolls_back() {
+        let mut r = Registry::new();
+
+        r.register_template_package([("page", "v1 {{> sidebar}}"), ("sidebar", "SIDE")])
+            .unwrap();
+
+        // v2 drops "sidebar" but "page" still references it: the package is
+        // no longer dependency-closed and must be rejected as a whole
+        let err = r
+            .register_template_package([("page", "v2 {{> sidebar}}")])
+            .unwrap_err();
+        assert_eq!(err.template_names(), vec!["page"]);
+        assert!(matches!(
+            err,
+            crate::TemplatePackageError::UnresolvedPartials(_)
+        ));
+
+        assert_eq!(r.render("page", &()).unwrap(), "v1 SIDE");
+        assert!(r.has_template("sidebar"));
+    }
+
+    #[test]
+    fn test_template_package_member_removal() {
+        let mut r = Registry::new();
+
+        // templates outside the package are not touched by package updates
+        r.register_template_string("standalone", "STANDALONE")
+            .unwrap();
+
+        r.register_template_package([("keep", "KEEP"), ("drop", "DROP")])
+            .unwrap();
+        assert!(r.has_template("drop"));
+
+        r.register_template_package([("keep", "KEEP2")]).unwrap();
+
+        assert_eq!(r.render("keep", &()).unwrap(), "KEEP2");
+        assert_eq!(r.render("standalone", &()).unwrap(), "STANDALONE");
+        assert!(!r.has_template("drop"));
+        assert!(matches!(
+            r.render("drop", &()).unwrap_err().reason(),
+            RenderErrorReason::TemplateNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn test_template_package_idempotent_replay() {
+        let mut r = Registry::new();
+
+        let package = [("a", "A {{> b}}"), ("b", "B")];
+        r.register_template_package(package).unwrap();
+        let first = r.render("a", &()).unwrap();
+        let count = r.get_templates().len();
+
+        // replaying the exact same content succeeds and changes nothing
+        r.register_template_package(package).unwrap();
+        assert_eq!(r.render("a", &()).unwrap(), first);
+        assert_eq!(r.get_templates().len(), count);
+
+        // replaying after an unrelated render still works
+        assert_eq!(r.render("a", &()).unwrap(), "A B");
+        r.register_template_package(package).unwrap();
+        assert_eq!(r.render("a", &()).unwrap(), "A B");
+    }
+
+    #[test]
+    fn test_template_package_dev_mode_file_source() {
+        let mut r = Registry::new();
+        r.set_dev_mode(true);
+
+        let dir = tempdir().unwrap();
+        let page_path = dir.path().join("page.hbs");
+        let part_path = dir.path().join("part.hbs");
+        {
+            let mut f: File = File::create(&page_path).unwrap();
+            write!(f, "PAGE[{{{{> part}}}}]").unwrap();
+        }
+        {
+            let mut f: File = File::create(&part_path).unwrap();
+            write!(f, "PART-V1").unwrap();
+        }
+
+        r.register_template_package_files([
+            ("page", page_path.clone()),
+            ("part", part_path.clone()),
+        ])
+        .unwrap();
+        assert_eq!(r.render("page", &()).unwrap(), "PAGE[PART-V1]");
+
+        // dev mode reloads package members from their files
+        {
+            let mut f: File = File::create(&part_path).unwrap();
+            write!(f, "PART-V2").unwrap();
+        }
+        assert_eq!(r.render("page", &()).unwrap(), "PAGE[PART-V2]");
+
+        // a package update that drops "part" must also drop its dev-mode
+        // source: the old file must not resurrect the removed member
+        r.register_template_package([("page", "PAGE-ONLY")])
+            .unwrap();
+        assert_eq!(r.render("page", &()).unwrap(), "PAGE-ONLY");
+        assert!(!r.has_template("part"));
+        assert!(matches!(
+            r.render("part", &()).unwrap_err().reason(),
+            RenderErrorReason::TemplateNotFound(_)
+        ));
+
+        // and a failed update leaves the dev-mode sources untouched
+        {
+            let mut f: File = File::create(&page_path).unwrap();
+            write!(f, "PAGE[{{{{> part}}}}]").unwrap();
+        }
+        assert!(
+            r.register_template_package([("page", "{{#if}}{{/each}}")])
+                .is_err()
+        );
+        assert_eq!(r.render("page", &()).unwrap(), "PAGE-ONLY");
 
         dir.close().unwrap();
     }
