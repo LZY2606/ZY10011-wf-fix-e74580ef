@@ -1,5 +1,14 @@
 # Change Log
 
+## [Unreleased]
+
+* [Added] `Handlebars::update_templates` for atomically replacing the whole
+  set of registered templates/partials with a validated package. All members
+  are compiled and their static partial references checked for closure before
+  the registry switches to the new package; on failure every failing member
+  is reported (`TemplateUpdateError`) and the previous templates and dev-mode
+  sources remain visible. File members are supported via `TemplateSource`.
+
 ## [6.4.4] - 2026-08-12
 
 * [Changed] We have to revert `preserve_json_order` as a default feature. Users

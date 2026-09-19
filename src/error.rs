@@ -1,4 +1,5 @@
 use std::borrow::ToOwned;
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt::{self, Write};
 use std::io::Error as IOError;
@@ -331,6 +332,54 @@ impl fmt::Display for TemplateError {
             ),
             _ => write!(f, "{}", self.reason()),
         }
+    }
+}
+
+/// Per-member failure reported by [`crate::Registry::update_templates`].
+///
+/// Every member of a template package is validated before the registry is
+/// updated, so a single `update_templates` call may report one of these for
+/// every member that failed.
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum TemplateUpdateMemberError {
+    /// The template source could not be parsed, or a file-backed template
+    /// could not be read.
+    #[error(transparent)]
+    Template(#[from] TemplateError),
+    /// The member name appeared more than once in the submitted package.
+    #[error("duplicate template name")]
+    DuplicateName,
+    /// The compiled template references a static partial (`{{> name}}`) that
+    /// is not part of the package and therefore would not resolve after the
+    /// package is committed. `referenced_by` lists every package member that
+    /// references the missing partial.
+    #[error("missing partial dependency {name:?} referenced by {referenced_by:?}")]
+    MissingDependency {
+        /// Name of the referenced partial that is not present in the package
+        name: String,
+        /// Names of package members that reference the partial
+        referenced_by: Vec<String>,
+    },
+}
+
+/// Error returned by [`crate::Registry::update_templates`] when a template
+/// package cannot be committed.
+///
+/// When this error is returned nothing has changed: the registry keeps
+/// serving the templates and dev-mode sources that were visible before the
+/// call. `members` is keyed by template name and contains every member that
+/// failed validation, sorted by name for stable diagnostics.
+#[derive(Debug, Error)]
+#[error("template package update failed for {} member(s): {}", self.members.len(), self.members.keys().cloned().collect::<Vec<_>>().join(", "))]
+pub struct TemplateUpdateError {
+    /// All failing members, keyed by template name.
+    pub members: BTreeMap<String, TemplateUpdateMemberError>,
+}
+
+impl TemplateUpdateError {
+    pub(crate) fn new(members: BTreeMap<String, TemplateUpdateMemberError>) -> Self {
+        Self { members }
     }
 }
 

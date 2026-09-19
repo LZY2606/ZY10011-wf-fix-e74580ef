@@ -371,6 +371,42 @@
 //! Handlebars.js' partial system is fully supported in this implementation.
 //! Check [example](https://github.com/sunng87/handlebars-rust/blob/master/examples/partials.rs#L49) for details.
 //!
+//! ### Atomic template packages
+//!
+//! A set of templates that reference each other can be updated together with
+//! [`Handlebars::update_templates`]. The submitted package is the complete
+//! set of templates visible after the call: members missing from a later
+//! package are removed, together with their dev-mode file sources.
+//!
+//! The package is validated before anything becomes visible: every member is
+//! loaded and compiled first, then every static partial reference
+//! (`{{> name}}`) must resolve to another member of the same package. The
+//! commit point is a single replacement of the registry's template and
+//! source maps, which happens only after all members validate. Because
+//! rendering borrows the registry immutably while the update requires a
+//! mutable borrow, an in-progress render keeps using the old package and no
+//! render can observe a half-swapped mix of templates. If any member fails,
+//! [`crate::TemplateUpdateError`] lists *every* failing member and the
+//! registry stays exactly as it was before the call.
+//!
+//! ```
+//! use handlebars::Handlebars;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut hbs = Handlebars::new();
+//! hbs.update_templates([
+//!     ("page", "<h1>{{> greeting}}</h1>"),
+//!     ("greeting", "Hello {{name}}"),
+//! ])?;
+//!
+//! assert_eq!(
+//!     hbs.render("page", &serde_json::json!({"name": "world"}))?,
+//!     "<h1>Hello world</h1>"
+//! );
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ### String (or Case) Helpers
 //!
 //! [Handlebars] supports helpers for converting string cases for example converting a value to
@@ -418,6 +454,7 @@ pub use self::block::{BlockContext, BlockParamHolder, BlockParams};
 pub use self::context::Context;
 pub use self::decorators::DecoratorDef;
 pub use self::error::{RenderError, RenderErrorReason, TemplateError, TemplateErrorReason};
+pub use self::error::{TemplateUpdateError, TemplateUpdateMemberError};
 pub use self::helpers::{HelperDef, HelperResult};
 pub use self::json::path::{Path, PathSeg};
 pub use self::json::value::{JsonRender, JsonTruthy, PathAndJson, ScopedJson, to_json};
@@ -425,7 +462,9 @@ pub use self::local_vars::LocalVars;
 pub use self::output::{Output, StringOutput, WriteOutput};
 #[cfg(feature = "dir_source")]
 pub use self::registry::{DirectorySourceOptions, DirectorySourceOptionsBuilder};
-pub use self::registry::{EscapeFn, Registry as Handlebars, html_escape, no_escape};
+pub use self::registry::{
+    EscapeFn, Registry as Handlebars, TemplateSource, html_escape, no_escape,
+};
 pub use self::render::{Decorator, Evaluable, Helper, RenderContext, Renderable};
 pub use self::template::Template;
 

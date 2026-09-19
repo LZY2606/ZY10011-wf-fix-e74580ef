@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::AsRef;
 use std::fmt::{self, Debug, Formatter};
 use std::io::{Error as IoError, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -13,11 +13,15 @@ use crate::decorators::{self, DecoratorDef};
 #[cfg(feature = "script_helper")]
 use crate::error::ScriptError;
 use crate::error::{RenderError, RenderErrorReason, TemplateError};
+use crate::error::{TemplateUpdateError, TemplateUpdateMemberError};
 use crate::helpers::{self, HelperDef};
 use crate::output::{Output, StringOutput, WriteOutput};
 use crate::render::{RenderContext, Renderable};
 use crate::sources::{FileSource, Source};
 use crate::support::str::{self, StringWriter};
+use crate::template::{
+    DecoratorTemplate, HelperTemplate, Parameter as TemplateParameter, TemplateElement,
+};
 use crate::template::{Template, TemplateOptions};
 
 #[cfg(feature = "dir_source")]
@@ -54,6 +58,80 @@ pub fn html_escape(data: &str) -> String {
 /// environment.
 pub fn no_escape(data: &str) -> String {
     data.to_owned()
+}
+
+/// Source of a template package member.
+///
+/// Used by [`Registry::update_templates`]. A member is either a template
+/// string compiled directly by the registry, or a file on the file system.
+/// File members behave like templates registered with
+/// [`Registry::register_template_file`]: they are read once for validation and,
+/// when dev mode is enabled, are reloaded from the file on every render.
+///
+/// `String`/`&str` and `PathBuf`/`&Path` convert into this type, so members
+/// can usually be passed as plain `(name, source)` tuples:
+///
+/// ```rust
+/// # use handlebars::{Handlebars, TemplateSource};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut hbs = Handlebars::new();
+/// let package: &[(&str, TemplateSource)] = &[
+///     ("page", "Hello {{> greeting}}".into()),
+///     ("greeting", TemplateSource::String("world".to_owned())),
+/// ];
+/// hbs.update_templates(package.iter().cloned())?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// File members are compiled (but not executed) in the docs:
+///
+/// ```no_run
+/// # use handlebars::{Handlebars, TemplateSource};
+/// # use std::path::PathBuf;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let mut hbs = Handlebars::new();
+/// hbs.update_templates([("from-disk", TemplateSource::File(PathBuf::from("templates/page.hbs")))])?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum TemplateSource {
+    /// A template source string that is compiled by the registry.
+    String(String),
+    /// Path to a template file on the file system.
+    File(PathBuf),
+}
+
+impl From<String> for TemplateSource {
+    fn from(s: String) -> Self {
+        TemplateSource::String(s)
+    }
+}
+
+impl From<&str> for TemplateSource {
+    fn from(s: &str) -> Self {
+        TemplateSource::String(s.to_owned())
+    }
+}
+
+impl From<&String> for TemplateSource {
+    fn from(s: &String) -> Self {
+        TemplateSource::String(s.clone())
+    }
+}
+
+impl From<PathBuf> for TemplateSource {
+    fn from(path: PathBuf) -> Self {
+        TemplateSource::File(path)
+    }
+}
+
+impl From<&Path> for TemplateSource {
+    fn from(path: &Path) -> Self {
+        TemplateSource::File(path.to_path_buf())
+    }
 }
 
 /// The single entry point of your Handlebars templates
@@ -145,6 +223,76 @@ impl Default for DirectorySourceOptions {
             temporary: false,
         }
     }
+}
+
+fn static_partial_name(name: &TemplateParameter) -> Option<String> {
+    match name.as_name() {
+        Some(raw) if !raw.starts_with('@') => Some(raw.to_owned()),
+        _ => None,
+    }
+}
+
+fn walk_decorator(decorator: &DecoratorTemplate, names: &mut Vec<String>) {
+    if let Some(name) = static_partial_name(&decorator.name) {
+        names.push(name);
+    }
+    if let Some(template) = &decorator.template {
+        walk_template(template, names);
+    }
+}
+
+fn walk_helper(helper: &HelperTemplate, names: &mut Vec<String>) {
+    if let Some(template) = &helper.template {
+        walk_template(template, names);
+    }
+    if let Some(template) = &helper.inverse {
+        walk_template(template, names);
+    }
+    for param in &helper.params {
+        if let TemplateParameter::Subexpression(subexpression) = param {
+            walk_element(&subexpression.element, names);
+        }
+    }
+    for param in helper.hash.values() {
+        if let TemplateParameter::Subexpression(subexpression) = param {
+            walk_element(&subexpression.element, names);
+        }
+    }
+}
+
+fn walk_element(element: &TemplateElement, names: &mut Vec<String>) {
+    match element {
+        TemplateElement::RawString(_) | TemplateElement::Comment(_) => {}
+        TemplateElement::PartialExpression(decorator)
+        | TemplateElement::PartialBlock(decorator) => walk_decorator(decorator, names),
+        TemplateElement::DecoratorExpression(decorator)
+        | TemplateElement::DecoratorBlock(decorator) => {
+            // `{{#*inline "name"}}` defines an inline partial rather than
+            // referencing one; its name is a string literal for which
+            // static_partial_name returns None.
+            walk_decorator(decorator, names);
+        }
+        TemplateElement::HtmlExpression(helper) | TemplateElement::Expression(helper) => {
+            walk_helper(helper, names)
+        }
+        TemplateElement::HelperBlock(helper) => walk_helper(helper, names),
+    }
+}
+
+fn walk_template(template: &Template, names: &mut Vec<String>) {
+    for element in &template.elements {
+        walk_element(element, names);
+    }
+}
+
+/// Collect the statically named partials referenced by a compiled template,
+/// including partials referenced from nested helper blocks, inline partials
+/// and subexpressions. Dynamic partials (`{{> (lookup)}}`) cannot be resolved
+/// at registration time and are not included.
+fn collect_static_partial_refs(template: &Template) -> Vec<String> {
+    let mut names = Vec::new();
+    walk_template(template, &mut names);
+    names
 }
 
 impl<'reg> Registry<'reg> {
@@ -315,6 +463,173 @@ impl<'reg> Registry<'reg> {
         S: AsRef<str>,
     {
         self.register_template_string(name, partial_str)
+    }
+
+    /// Atomically replace all registered templates and partials with a new
+    /// package.
+    ///
+    /// `templates` is an iterable of `(name, source)` pairs; `source` can be a
+    /// template string, a [`TemplateSource`], or a file path. The package
+    /// becomes the complete set of templates visible in the registry:
+    ///
+    /// * every member is loaded and compiled up front;
+    /// * every static partial reference (`{{> name}}` and `{{#> name}}`) used
+    ///   by a member must resolve to another member of the same package;
+    /// * only when all members validate does the registry switch to the new
+    ///   templates and dev-mode file sources in one commit.
+    ///
+    /// If any member fails, the call reports *all* failing members in
+    /// [`TemplateUpdateError`] and leaves the registry exactly as it was before
+    /// the call: previously registered templates keep rendering, members
+    /// missing from the new package stay available, and in dev mode no stale
+    /// file source is left behind. Helpers, decorators, the escape function and
+    /// strict mode are not affected.
+    ///
+    /// Because templates are only committed after full validation, an
+    /// in-progress render can never observe a mixture of old and new package
+    /// members: rendering borrows the registry immutably, while this method
+    /// requires a mutable borrow, and the actual switch is a single replacement
+    /// of the template and source maps.
+    ///
+    /// Submitting the same package again is idempotent: identical contents
+    /// reproduce the same visible templates, and members absent from a later
+    /// package are removed together with their dev-mode sources.
+    ///
+    /// ```rust
+    /// # use handlebars::Handlebars;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut hbs = Handlebars::new();
+    ///
+    /// // a package of two templates that reference each other
+    /// hbs.update_templates([
+    ///     ("page", "<h1>{{> greeting}}</h1>"),
+    ///     ("greeting", "Hello {{name}}"),
+    /// ])?;
+    /// assert_eq!(
+    ///     hbs.render("page", &serde_json::json!({"name": "world"})).unwrap(),
+    ///     "<h1>Hello world</h1>"
+    /// );
+    ///
+    /// // a broken package keeps the previous version visible
+    /// let err = hbs
+    ///     .update_templates([("page", "{{#if}}"), ("greeting", "Hi")])
+    ///     .unwrap_err();
+    /// assert!(err.members.contains_key("page"));
+    /// assert_eq!(
+    ///     hbs.render("page", &serde_json::json!({"name": "world"})).unwrap(),
+    ///     "<h1>Hello world</h1>"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn update_templates<I, N, S>(&mut self, templates: I) -> Result<(), TemplateUpdateError>
+    where
+        I: IntoIterator<Item = (N, S)>,
+        N: Into<String>,
+        S: Into<TemplateSource>,
+    {
+        // First pass: collect entries and detect duplicate names without
+        // touching the registry yet.
+        let mut entries: BTreeMap<String, TemplateSource> = BTreeMap::new();
+        let mut errors: BTreeMap<String, TemplateUpdateMemberError> = BTreeMap::new();
+        for (name, source) in templates {
+            let name = name.into();
+            if entries.insert(name.clone(), source.into()).is_some() {
+                errors.insert(name, TemplateUpdateMemberError::DuplicateName);
+            }
+        }
+
+        // Second pass: load and compile every unique member off-registry.
+        let mut compiled: BTreeMap<String, Template> = BTreeMap::new();
+        let mut sources: BTreeMap<
+            String,
+            Arc<dyn Source<Item = String, Error = IoError> + Send + Sync + 'reg>,
+        > = BTreeMap::new();
+        for (name, source) in &entries {
+            if errors.contains_key(name) {
+                continue;
+            }
+            match source {
+                TemplateSource::String(tpl_str) => {
+                    match Template::compile2(
+                        tpl_str,
+                        TemplateOptions {
+                            name: Some(name.clone()),
+                            is_partial: false,
+                            prevent_indent: self.prevent_indent,
+                        },
+                    ) {
+                        Ok(template) => {
+                            compiled.insert(name.clone(), template);
+                        }
+                        Err(err) => {
+                            errors.insert(name.clone(), TemplateUpdateMemberError::Template(err));
+                        }
+                    }
+                }
+                TemplateSource::File(path) => {
+                    let file_source = FileSource::new(path.clone());
+                    match file_source
+                        .load()
+                        .map_err(|err| TemplateError::from((err, name.clone())))
+                        .and_then(|tpl_str| {
+                            Template::compile2(
+                                &tpl_str,
+                                TemplateOptions {
+                                    name: Some(name.clone()),
+                                    is_partial: false,
+                                    prevent_indent: self.prevent_indent,
+                                },
+                            )
+                        }) {
+                        Ok(template) => {
+                            compiled.insert(name.clone(), template);
+                            if self.dev_mode {
+                                sources.insert(name.clone(), Arc::new(file_source));
+                            }
+                        }
+                        Err(err) => {
+                            errors.insert(name.clone(), TemplateUpdateMemberError::Template(err));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Third pass: verify that static partial references are closed inside
+        // the package. Only templates that compiled are inspected, since
+        // broken members have already been reported above.
+        let mut missing: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, template) in &compiled {
+            for dependency in collect_static_partial_refs(template) {
+                if !compiled.contains_key(&dependency) {
+                    missing.entry(dependency).or_default().push(name.clone());
+                }
+            }
+        }
+        for (dependency, mut referenced_by) in missing {
+            referenced_by.sort();
+            referenced_by.dedup();
+            for name in &referenced_by {
+                errors.insert(
+                    name.clone(),
+                    TemplateUpdateMemberError::MissingDependency {
+                        name: dependency.clone(),
+                        referenced_by: referenced_by.clone(),
+                    },
+                );
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(TemplateUpdateError::new(errors));
+        }
+
+        // Commit point: both maps are built entirely in locals and swapped in
+        // here, so every render either sees the old package or the new one.
+        self.templates = compiled.into_iter().collect();
+        self.template_sources = sources.into_iter().collect();
+        Ok(())
     }
 
     /// Register a template from a path on file system
